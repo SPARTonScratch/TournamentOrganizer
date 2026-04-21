@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import re
 
 # Terminal color constants for cross-platform compatibility
 RESET = "\033[0m"
@@ -27,6 +28,62 @@ class ChessOrganizer:
         print("Welcome to Chess Tournament Organizer!")
         self._print_status()
         self._cli_loop()
+
+    # --- Utility Helpers ---
+    @staticmethod
+    def _visible_len(text):
+        """Calculates visible character count, ignoring ANSI escape sequences."""
+        return len(re.sub(r'\x1b\[[0-9;]*m', '', str(text)))
+
+    @staticmethod
+    def _pad_text(text, width, alignment='left'):
+        """Pads text to target visible width, safely ignoring ANSI codes."""
+        visible = len(re.sub(r'\x1b\[[0-9;]*m', '', str(text)))
+        pad = max(0, width - visible)
+        if alignment == 'right':
+            return ' ' * pad + str(text)
+        elif alignment == 'center':
+            left = pad // 2
+            return ' ' * left + str(text) + ' ' * (pad - left)
+        return str(text) + ' ' * pad
+
+    def _ask_confirm(self, msg):
+        """Prompts user for confirmation. Returns True only on 'y'."""
+        resp = input(f"\n{YELLOW}{msg} (y/n): {RESET}").strip().lower()
+        return resp == "y"
+
+    @staticmethod
+    def _render_table(headers, rows, alignments=None, col_pad=2):
+        """Dynamically scales and prints a terminal-safe table with ANSI support."""
+        if not headers: return
+        n_cols = len(headers)
+        if alignments is None:
+            alignments = ['left'] * n_cols
+
+        # Calculate max visible width per column
+        col_widths = []
+        for i in range(n_cols):
+            w = ChessOrganizer._visible_len(str(headers[i]))
+            for r in rows:
+                if i < len(r):
+                    w = max(w, ChessOrganizer._visible_len(str(r[i])))
+            col_widths.append(w)
+
+        # Row formatter
+        def _fmt_row(vals):
+            parts = []
+            for i in range(n_cols):
+                val = str(vals[i]) if i < len(vals) else ""
+                target_w = col_widths[i] + col_pad
+                parts.append(ChessOrganizer._pad_text(val, target_w, alignments[i]))
+            return " | ".join(parts)
+
+        # Separator matches exact printed width
+        sep_len = sum(col_widths) + (col_pad * n_cols) + (3 * (n_cols - 1))
+        print(_fmt_row(headers))
+        print("-" * sep_len)
+        for r in rows:
+            print(_fmt_row(r))
 
     # --- State Management ---
     def _load_state(self):
@@ -65,7 +122,6 @@ class ChessOrganizer:
         pts = {p: 0.0 for p in players if p != "0"}
         sb = {p: 0.0 for p in pts}
 
-        # Pass 1: Aggregate match points
         for r in tournament["rounds"]:
             for g in r["games"]:
                 if g["result"]:
@@ -78,7 +134,6 @@ class ChessOrganizer:
                         if winner in pts:
                             pts[winner] += 1.0
 
-        # Pass 2: Compute dynamic SB
         for r in tournament["rounds"]:
             for g in r["games"]:
                 if g["result"] and g["white"] != "0" and g["black"] != "0":
@@ -157,11 +212,11 @@ class ChessOrganizer:
             if not t_dict:
                 print(f"{YELLOW}No tournaments found.{RESET}")
                 return
-            print(f"\n{CYAN}{'TOURNAMENT NAME':<25} | {'ROUNDS':<6}{RESET}")
-            print("-" * 35)
-            for name, data in t_dict.items():
-                rounds = len(data.get("rounds", []))
-                print(f"{GREEN}{name:<25}{RESET} | {rounds:<6}")
+            self._render_table(
+                ["TOURNAMENT NAME", "ROUNDS"],
+                [(f"{GREEN}{k}{RESET}", v.get("rounds", []).__len__()) for k, v in t_dict.items()],
+                alignments=["left", "right"]
+            )
             return
 
         if len(args) == 1:
@@ -184,9 +239,7 @@ class ChessOrganizer:
             if name not in self.state["tournaments"]:
                 print(f"{RED}Tournament '{name}' not found.{RESET}")
                 return
-            confirm = input(
-                f"\n{YELLOW}Delete tournament '{name}'? All data will be lost. (y/n): {RESET}").strip().lower()
-            if confirm == "y":
+            if self._ask_confirm(f"Delete tournament '{name}'? All data will be lost."):
                 del self.state["tournaments"][name]
                 if self.state.get("active_tournament") == name:
                     self.state["active_tournament"] = None
@@ -214,7 +267,7 @@ class ChessOrganizer:
         print(f"{GREEN}Added '{name_raw}' as ID {pid}.{RESET}")
 
     def _cmd_rounds(self, args):
-        """Displays round status, detailed pairings, unmatched players, and manages game boards."""
+        """Displays round status, manages pairings, and handles generation/results."""
         active = self._get_active()
         if not active:
             print(f"{RED}No tournament active.{RESET}")
@@ -223,30 +276,36 @@ class ChessOrganizer:
         t = self.state["tournaments"][active]
 
         if not args:
-            print(f"\n{CYAN}{'ROUND':>5} | {'GAMES':>5} | {'STATUS':<12}{RESET}")
-            print("-" * 30)
-            for r in t["rounds"]:
-                played = sum(1 for g in r["games"] if g["result"])
-                total = len(r["games"])
-                status = "Complete" if played == total else ("In Progress" if played > 0 else "Pending")
-                print(f"{r['round_num']:>5} | {total:>5} | {status:<12}")
+            self._render_table(
+                ["ROUND", "GAMES", "STATUS"],
+                [(r["round_num"], len(r["games"]),
+                  "Complete" if all(g["result"] for g in r["games"]) else
+                  ("In Progress" if any(g["result"] for g in r["games"]) else "Pending"))
+                 for r in t["rounds"]],
+                alignments=["right", "right", "left"]
+            )
             return
 
         if args[0].lower() == "clear":
-            confirm = input(f"\n{YELLOW}Wipe ALL rounds & results? (y/n): {RESET}").strip().lower()
-            if confirm != "y":
-                print("Cancelled.")
+            if self._ask_confirm("Wipe ALL rounds & results?"):
+                t["rounds"] = []
+                self._save_state()
+                print(f"{GREEN}All rounds cleared.{RESET}")
+            return
+
+        if len(args) >= 2 and args[0].lower() == "gen":
+            mode = args[1].lower()
+            if mode not in ("rr", "drr"):
+                print(f"{RED}Invalid type. Use 'rr' or 'drr'.{RESET}")
                 return
-            t["rounds"] = []
-            self._save_state()
-            print(f"{GREEN}All rounds cleared.{RESET}")
+            self._generate_rounds(mode)
             return
 
         try:
             r_num = int(args[0])
         except ValueError:
             print(
-                f"{RED}Invalid argument. Use: rounds <number> / <r> clear / <r> <w> <b> add / <r> <g_a> <g_b> switch / <r> <g> del{RESET}")
+                f"{RED}Invalid argument. Use: rounds / rounds <num> / rounds gen <type> / rounds <r> clear / ...{RESET}")
             return
 
         if r_num < 1 or r_num > len(t["rounds"]):
@@ -255,7 +314,7 @@ class ChessOrganizer:
 
         r = t["rounds"][r_num - 1]
 
-        # Handle 'add' game to round
+        # Add custom game
         if len(args) == 4 and args[3].lower() == "add":
             w_raw, b_raw = args[1], args[2]
             w_id = "0" if w_raw.lower() == "bye" else w_raw
@@ -278,7 +337,8 @@ class ChessOrganizer:
 
             bye_count = sum(1 for g in r["games"] if g["white"] == "0" or g["black"] == "0")
             if (w_id == "0" or b_id == "0") and bye_count >= 1:
-                print(f"{YELLOW}Warning: Multiple BYEs detected in Round {r_num}. Proceeding as requested.{RESET}")
+                if not self._ask_confirm(f"Multiple BYEs detected in Round {r_num}. Proceed?"):
+                    return
 
             new_game = {"game_num": len(r["games"]) + 1, "white": w_id, "black": b_id, "result": None}
             if w_id == "0" and b_id != "0":
@@ -292,7 +352,7 @@ class ChessOrganizer:
                 f"{GREEN}Added Game {new_game['game_num']} (ID {w_id} vs {b_id}) to Round {r_num}. Auto-saved.{RESET}")
             return
 
-        # Handle 'switch' board positions
+        # Switch board positions
         if len(args) == 4 and args[3].lower() == "switch":
             try:
                 g_a, g_b = int(args[1]), int(args[2])
@@ -311,7 +371,7 @@ class ChessOrganizer:
             print(f"{GREEN}Swapped board positions for Game {g_a} and {g_b} in Round {r_num}.{RESET}")
             return
 
-        # Handle 'del' specific game
+        # Delete specific game
         if len(args) == 3 and args[2].lower() == "del":
             try:
                 g_num = int(args[1])
@@ -322,8 +382,9 @@ class ChessOrganizer:
             if idx is None:
                 print(f"{RED}Game {g_num} not found in Round {r_num}.{RESET}")
                 return
-            if r["games"][idx]["result"]:
-                print(f"{YELLOW}Warning: Game {g_num} has a recorded result. Deleting will remove the result.{RESET}")
+            if r["games"][idx]["result"] and not self._ask_confirm(
+                    f"Game {g_num} has a recorded result. Delete anyway?"):
+                return
             r["games"].pop(idx)
             for i, g in enumerate(r["games"]):
                 g["game_num"] = i + 1
@@ -331,74 +392,61 @@ class ChessOrganizer:
             print(f"{GREEN}Deleted Game {g_num} from Round {r_num}. Games auto-renumbered.{RESET}")
             return
 
-        # Display specific round pairings & unmatched players
+        # Record result
+        if len(args) == 4 and args[2].lower() == "res":
+            outcome = args[3].lower()
+            if outcome not in ("w", "d", "b"):
+                print(f"{RED}Outcome must be 'w', 'b', or 'd'.{RESET}")
+                return
+            try:
+                g_num = int(args[1])
+            except ValueError:
+                print(f"{RED}Game number must be an integer.{RESET}")
+                return
+            if g_num < 1 or g_num > len(r["games"]):
+                print(f"{RED}Invalid game in Round {r_num}.{RESET}")
+                return
+
+            game = r["games"][g_num - 1]
+            if game["result"] and not self._ask_confirm(
+                    f"Round {r_num} Game {g_num} already recorded ('{game['result']}'). Overwrite?"):
+                return
+
+            game["result"] = outcome
+            self._save_state()
+            print(f"{GREEN}Round {r_num} Game {g_num} set to '{outcome}'. Auto-saved.{RESET}")
+            return
+
+        # Default: Show round pairings & unmatched
         if len(args) == 1:
-            print(f"\n{CYAN}=== ROUND {r_num} PAIRINGS ==={RESET}")
-            print(f"{'GAME':>4} | {'WHITE (ID)':<20} | {'BLACK (ID)':<20} | {'RESULT':<6}")
-            print("-" * 56)
+            pair_rows = []
+            paired_ids = set()
             for g in r["games"]:
                 w_name = t["players"].get(g["white"], {}).get("name", "?")
                 b_name = t["players"].get(g["black"], {}).get("name", "?")
                 w_disp = f"{w_name} ({g['white']})" if g["white"] != "0" else "BYE (0)"
                 b_disp = f"{b_name} ({g['black']})" if g["black"] != "0" else "BYE (0)"
                 res = g["result"] if g["result"] else "--"
-                print(f"{g['game_num']:>4} | {w_disp:<20} | {b_disp:<20} | {res:<6}")
+                pair_rows.append([g["game_num"], w_disp, b_disp, res])
+                paired_ids.add(g["white"])
+                paired_ids.add(g["black"])
 
-            paired_ids = {g["white"] for g in r["games"]} | {g["black"] for g in r["games"]}
+            print(f"\n{CYAN}=== ROUND {r_num} PAIRINGS ==={RESET}")
+            self._render_table(["GAME", "WHITE (ID)", "BLACK (ID)", "RESULT"], pair_rows,
+                               ["right", "left", "left", "left"])
+
             unmatched = [(pid, t["players"][pid]["name"]) for pid in t["players"] if
                          pid != "0" and pid not in paired_ids]
             unmatched.sort(key=lambda x: int(x[0]))
 
             if unmatched:
                 print(f"\n{CYAN}--- UNMATCHED PLAYERS ---{RESET}")
-                print(f"{'ID':>4} | {'NAME':<20}")
-                print("-" * 28)
-                for pid, name in unmatched:
-                    print(f"{pid:>4} | {name:<20}")
+                self._render_table(["ID", "NAME"], unmatched, ["right", "left"])
             else:
                 print(f"\n{GREEN}All active players are paired.{RESET}")
             return
 
         print(f"{RED}Invalid arguments for rounds command.{RESET}")
-
-    def _cmd_result(self, args):
-        """Records a match outcome and updates points/SB dynamically."""
-        active = self._get_active()
-        if not active:
-            print(f"{RED}No tournament active.{RESET}")
-            return
-
-        if len(args) != 3:
-            print(f"{RED}Usage: result <round> <game> <w|d|b>{RESET}")
-            return
-
-        r_str, g_str, outcome = args
-        if outcome not in ("w", "d", "b"):
-            print(f"{RED}Outcome must be 'w', 'b', or 'd'.{RESET}")
-            return
-
-        try:
-            r_num, g_num = int(r_str), int(g_str)
-        except ValueError:
-            print(f"{RED}Round and Game must be integers.{RESET}")
-            return
-
-        t = self.state["tournaments"][active]
-        if r_num < 1 or r_num > len(t["rounds"]):
-            print(f"{RED}Invalid round. Max round: {len(t['rounds'])}{RESET}")
-            return
-        if g_num < 1 or g_num > len(t["rounds"][r_num - 1]["games"]):
-            print(f"{RED}Invalid game in Round {r_num}.{RESET}")
-            return
-
-        game = t["rounds"][r_num - 1]["games"][g_num - 1]
-        if game["result"]:
-            print(
-                f"{YELLOW}Warning: Round {r_num} Game {g_num} already recorded ('{game['result']}'). Overwriting.{RESET}")
-
-        game["result"] = outcome
-        self._save_state()
-        print(f"{GREEN}Round {r_num} Game {g_num} set to '{outcome}'.{RESET}")
 
     def _cmd_info(self, args):
         """Displays standings or individual player match history."""
@@ -413,11 +461,8 @@ class ChessOrganizer:
             players = [(pid, t["players"][pid]["name"], pts.get(pid, 0), sb.get(pid, 0))
                        for pid in t["players"] if pid != "0"]
             players.sort(key=lambda x: (-x[2], -x[3], int(x[0])))
-
-            print(f"\n{CYAN}{'ID':>3} | {'NAME':<20} | {'PTS':>5} | {'SB':>6}{RESET}")
-            print("-" * 44)
-            for pid, name, p, s in players:
-                print(f"{pid:>3} | {name:<20.20} | {p:>5.1f} | {s:>6.2f}")
+            print(f"\n{CYAN}=== LIVE STANDINGS ==={RESET}")
+            self._render_table(["ID", "NAME", "PTS", "SB"], players, ["right", "left", "right", "right"])
         else:
             pid = args[0]
             if pid == "0" or pid not in t["players"]:
@@ -428,10 +473,8 @@ class ChessOrganizer:
             p_total = pts.get(pid, 0)
             s_total = sb.get(pid, 0)
             print(f"\n{CYAN}Player: {name} (ID: {pid}) | Total: {p_total:.1f} | SB: {s_total:.2f}{RESET}")
-            print("-" * 72)
-            print(f"{'Round':>5} | {'Game':>4} | {'Opponent (ID)':<18} | {'Color':<5} | {'Res':<4} | {'SB+':>5}")
-            print("-" * 72)
 
+            history = []
             for r in t["rounds"]:
                 for g in r["games"]:
                     if g["white"] == pid or g["black"] == pid:
@@ -447,36 +490,36 @@ class ChessOrganizer:
                             elif (g["white"] == pid and g["result"] == "w") or (
                                     g["black"] == pid and g["result"] == "b"):
                                 sb_gain = opp_pts
-                        opp_disp = f"{opp_name} ({opp})"
-                        print(
-                            f"{r['round_num']:>5} | {g['game_num']:>4} | {opp_disp:<18.18} | {color:<5} | {res:<4} | {sb_gain:>5.2f}")
+                        history.append(
+                            [r["round_num"], g["game_num"], f"{opp_name} ({opp})", color, res, f"{sb_gain:.2f}"])
+
+            print(f"{'-' * 70}")
+            self._render_table(["ROUND", "GAME", "OPPONENT (ID)", "COLOR", "RES", "SB+"], history,
+                               ["right", "right", "left", "center", "left", "right"])
 
     def _show_help(self):
-        """Renders the command manual with grouped entries, separators, and optimized column widths."""
-        print(f"\n{CYAN}{'COMMAND':<14} | {'USAGE':<32} | {'DESCRIPTION':<44}{RESET}")
-        print("-" * 95)
+        """Renders the command manual using the dynamic table formatter."""
         entries = [
             ("tournaments", "", "List all tournaments & round counts"),
             ("", "[name]", "Create new or load existing tournament"),
             ("", "[name] del", "Delete tournament & associated data"),
             ("add", "<player_name>", "Register a player (auto-assigned numeric ID)"),
-            ("generate", "rr", "Append single round-robin schedule"),
-            ("", "drr", "Append double round-robin schedule"),
             ("rounds", "", "Show round overview & completion status"),
+            ("", "gen [rr|drr]", "Generate and append round-robin schedule"),
             ("", "<number>", "Show detailed pairings & unmatched players"),
-            ("", "<round> <w_id> <b_id> add", "Add custom game to specific round"),
-            ("", "<round> <g_a> <g_b> switch", "Swap board positions of two games"),
-            ("", "<round> <game> del", "Remove specific game (auto-renumbers)"),
+            ("", "<r> <w_id> <b_id> add", "Add custom game to specific round"),
+            ("", "<r> <g_a> <g_b> switch", "Swap board positions of two games"),
+            ("", "<r> <game> del", "Remove specific game (auto-renumbers)"),
             ("", "clear", "Wipe all rounds & results"),
-            ("result", "<round> <game> <w|d|b>", "Record game outcome (1-indexed)"),
+            ("", "<r> <game> res [w|d|b]", "Record game outcome for round/game"),
             ("info", "", "Display live standings table"),
             ("", "<player_id>", "Show match history & SB contribution"),
             ("help", "", "Display this command manual"),
             ("exit", "", "Save tournament state & close application"),
         ]
-        for cmd, usage, desc in entries:
-            print(f"{GREEN}{cmd:<14}{RESET} | {usage:<32} | {desc:<44}")
-            print("-" * 95)
+        rows = [(f"{GREEN}{cmd}{RESET}", usage, desc) for cmd, usage, desc in entries]
+        print()
+        self._render_table(["COMMAND", "USAGE", "DESCRIPTION"], rows, alignments=["left", "left", "left"])
 
     # --- Interactive Command Loop ---
     def _cli_loop(self):
@@ -495,12 +538,8 @@ class ChessOrganizer:
                     self._cmd_tournaments(arg.split() if arg else [])
                 elif cmd == "add":
                     self._cmd_add(arg.strip())
-                elif cmd == "generate":
-                    self._generate_rounds(arg.strip().lower())
-                elif cmd.startswith("rounds"):
+                elif cmd == "rounds":
                     self._cmd_rounds(arg.split() if arg else [])
-                elif cmd == "result":
-                    self._cmd_result(arg.split())
                 elif cmd == "info":
                     self._cmd_info(arg.split())
                 elif cmd == "exit":
