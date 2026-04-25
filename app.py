@@ -15,6 +15,9 @@ CYAN = "\033[96m"
 # State persistence path
 STATE_FILE = "state.json"
 
+# Application version
+VERSION = "0.4"
+
 
 class ChessOrganizer:
     """
@@ -148,10 +151,77 @@ class ChessOrganizer:
                             sb[winner] += pts[loser]
         return pts, sb
 
+    # --- Player Management ---
+    def _cmd_player(self, args):
+        """Handles player add/del/switch subcommands."""
+        active = self._get_active()
+        if not active:
+            print(f"{RED}No tournament active.{RESET}")
+            return
+
+        t = self.state["tournaments"][active]
+
+        if not args:
+            print(f"{RED}Usage: player add <name> | player del <id> | player switch <id> <new_name>{RESET}")
+            return
+
+        subcmd = args[0].lower()
+
+        if subcmd == "add":
+            if len(args) < 2:
+                print(f"{RED}Usage: player add <player_name>{RESET}")
+                return
+            name_raw = " ".join(args[1:])
+            pid = str(t["next_player_id"])
+            t["players"][pid] = {"name": name_raw}
+            t["next_player_id"] += 1
+            self._save_state()
+            print(f"{GREEN}Added '{name_raw}' as ID {pid}.{RESET}")
+
+        elif subcmd == "del":
+            if len(args) < 2:
+                print(f"{RED}Usage: player del <player_id>{RESET}")
+                return
+            pid = args[1]
+            if pid == "0" or pid not in t["players"]:
+                print(f"{RED}Invalid player ID.{RESET}")
+                return
+            if not self._ask_confirm(
+                    f"Delete player '{t['players'][pid]['name']}' (ID {pid})? All their game slots will be replaced with BYE."):
+                return
+            # Replace all occurrences of this player with BYE (ID "0")
+            for r in t["rounds"]:
+                for g in r["games"]:
+                    if g["white"] == pid:
+                        g["white"] = "0"
+                        g["result"] = "b" if g["black"] != "0" else None
+                    elif g["black"] == pid:
+                        g["black"] = "0"
+                        g["result"] = "w" if g["white"] != "0" else None
+            del t["players"][pid]
+            self._save_state()
+            print(f"{GREEN}Player {pid} deleted. All their matches replaced with BYE.{RESET}")
+
+        elif subcmd == "switch":
+            if len(args) < 3:
+                print(f"{RED}Usage: player switch <player_id> <new_name>{RESET}")
+                return
+            pid, new_name = args[1], " ".join(args[2:])
+            if pid not in t["players"]:
+                print(f"{RED}Invalid player ID.{RESET}")
+                return
+            old_name = t["players"][pid]["name"]
+            t["players"][pid]["name"] = new_name
+            self._save_state()
+            print(f"{GREEN}Renamed ID {pid}: '{old_name}' -> '{new_name}'.{RESET}")
+
+        else:
+            print(f"{RED}Unknown player subcommand. Use: add, del, switch.{RESET}")
+
     # --- Pairing Generation ---
     def _generate_rounds(self, mode):
         """
-        Appends Round Robin or Double Round Robin schedules to the active tournament.
+        Appends Round Robin, Double Round Robin, or Points-based rounds.
         Automatically assigns BYE results (1 point) when player count is odd.
         """
         active = self._get_active()
@@ -165,15 +235,35 @@ class ChessOrganizer:
             print(f"{RED}Minimum 2 players required to generate rounds.{RESET}")
             return
 
+        if mode == "pts":
+            # Points-based (Swiss-style) single round generation
+            pairings = self._generate_pts_pairing(t)
+            if not pairings:
+                return
+            round_num = len(t["rounds"]) + 1
+            r_data = {"round_num": round_num, "games": []}
+            for j, (w, b) in enumerate(pairings):
+                res = "b" if w == "0" else ("w" if b == "0" else None)
+                r_data["games"].append({
+                    "game_num": j + 1,
+                    "white": w,
+                    "black": b,
+                    "result": res
+                })
+            t["rounds"].append(r_data)
+            self._save_state()
+            print(f"{GREEN}Generated Round {round_num} (points-based). Auto-saved.{RESET}")
+            return
+
+        # Standard Circle Method for rr/drr
         ids = players[:]
         if len(ids) % 2 == 1:
-            ids.append("0")  # Append BYE placeholder
+            ids.append("0")
         n = len(ids)
         generated = []
         fixed = ids[0]
         rotating = ids[1:]
 
-        # Standard Circle Method pairing algorithm
         for _ in range(n - 1):
             round_pairings = []
             current = [fixed] + rotating
@@ -186,7 +276,6 @@ class ChessOrganizer:
             for i in range(len(generated)):
                 generated.append([(b, w) for w, b in generated[i]])
 
-        # Append to tournament state without overwriting existing data
         start_r = len(t["rounds"]) + 1
         for i, round_pairings in enumerate(generated):
             r_data = {"round_num": start_r + i, "games": []}
@@ -203,6 +292,64 @@ class ChessOrganizer:
         self._save_state()
         print(
             f"{GREEN}Generated {len(generated)} rounds ({start_r}-{start_r + len(generated) - 1}). Auto-saved.{RESET}")
+
+    def _generate_pts_pairing(self, tournament):
+        """
+        Generates a single points-based (Swiss-style) round.
+        Pairs closest-scoring players, avoids rematches if possible.
+        """
+        players = [p for p in tournament["players"].keys() if p != "0"]
+        if len(players) < 2:
+            print(f"{RED}Need at least 2 players for points-based pairing.{RESET}")
+            return None
+
+        pts, sb = self._calc_points_sb(tournament)
+        scored = [(pid, pts.get(pid, 0), sb.get(pid, 0)) for pid in players]
+        scored.sort(key=lambda x: (-x[1], -x[2], int(x[0])))
+
+        # Build previous matchup map: {frozenset({p1,p2}): white_player_id}
+        prev = {}
+        for r in tournament["rounds"]:
+            for g in r["games"]:
+                if g["white"] != "0" and g["black"] != "0":
+                    key = frozenset([g["white"], g["black"]])
+                    prev[key] = g["white"]
+
+        available = [pid for pid, _, _ in scored]
+        pairings = []
+
+        while len(available) >= 2:
+            candidate = available[0]
+            paired = False
+
+            # Try to find first unplayed opponent
+            for i in range(1, len(available)):
+                opponent = available[i]
+                key = frozenset([candidate, opponent])
+                if key not in prev:
+                    # New matchup: higher-seeded gets white
+                    pairings.append((candidate, opponent))
+                    available.pop(i)
+                    available.pop(0)
+                    paired = True
+                    break
+
+            # If all have played, pair anyway but reverse colors
+            if not paired:
+                opponent = available[1]
+                key = frozenset([candidate, opponent])
+                if prev.get(key) == candidate:
+                    pairings.append((opponent, candidate))
+                else:
+                    pairings.append((candidate, opponent))
+                available.pop(1)
+                available.pop(0)
+
+        # Handle odd player: assign BYE to lowest-seeded
+        if available:
+            pairings.append(("0", available[0]))
+
+        return pairings
 
     # --- Command Handlers ---
     def _cmd_tournaments(self, args):
@@ -250,22 +397,6 @@ class ChessOrganizer:
         else:
             print(f"{RED}Usage: tournaments  |  tournaments <name>  |  tournaments <name> del{RESET}")
 
-    def _cmd_add(self, name_raw):
-        """Registers a new player with an auto-incremented numeric ID."""
-        active = self._get_active()
-        if not active:
-            print(f"{RED}No tournament active.{RESET}")
-            return
-        if not name_raw:
-            print(f"{RED}Usage: add <player_name>{RESET}")
-            return
-        t = self.state["tournaments"][active]
-        pid = str(t["next_player_id"])
-        t["players"][pid] = {"name": name_raw}
-        t["next_player_id"] += 1
-        self._save_state()
-        print(f"{GREEN}Added '{name_raw}' as ID {pid}.{RESET}")
-
     def _cmd_rounds(self, args):
         """Displays round status, manages pairings, and handles generation/results."""
         active = self._get_active()
@@ -287,16 +418,37 @@ class ChessOrganizer:
             return
 
         if args[0].lower() == "clear":
-            if self._ask_confirm("Wipe ALL rounds & results?"):
-                t["rounds"] = []
-                self._save_state()
-                print(f"{GREEN}All rounds cleared.{RESET}")
+            if len(args) == 1:
+                # Clear all rounds
+                if self._ask_confirm("Wipe ALL rounds & results?"):
+                    t["rounds"] = []
+                    self._save_state()
+                    print(f"{GREEN}All rounds cleared.{RESET}")
+            elif len(args) == 2:
+                # Clear specific round
+                try:
+                    r_num = int(args[1])
+                except ValueError:
+                    print(f"{RED}Round number must be an integer.{RESET}")
+                    return
+                if r_num < 1 or r_num > len(t["rounds"]):
+                    print(f"{RED}Invalid round. Tournament has {len(t['rounds'])} rounds.{RESET}")
+                    return
+                if self._ask_confirm(f"Delete Round {r_num} and all its games?"):
+                    t["rounds"].pop(r_num - 1)
+                    # Re-number remaining rounds
+                    for i, r in enumerate(t["rounds"], 1):
+                        r["round_num"] = i
+                    self._save_state()
+                    print(f"{GREEN}Round {r_num} deleted. Remaining rounds re-numbered.{RESET}")
+            else:
+                print(f"{RED}Usage: rounds clear  |  rounds clear <round_num>{RESET}")
             return
 
         if len(args) >= 2 and args[0].lower() == "gen":
             mode = args[1].lower()
-            if mode not in ("rr", "drr"):
-                print(f"{RED}Invalid type. Use 'rr' or 'drr'.{RESET}")
+            if mode not in ("rr", "drr", "pts"):
+                print(f"{RED}Invalid type. Use 'rr', 'drr', or 'pts'.{RESET}")
                 return
             self._generate_rounds(mode)
             return
@@ -305,7 +457,7 @@ class ChessOrganizer:
             r_num = int(args[0])
         except ValueError:
             print(
-                f"{RED}Invalid argument. Use: rounds / rounds <num> / rounds gen <type> / rounds <r> clear / ...{RESET}")
+                f"{RED}Invalid argument. Use: rounds / rounds <num> / rounds gen <type> / rounds clear [num] / ...{RESET}")
             return
 
         if r_num < 1 or r_num > len(t["rounds"]):
@@ -458,11 +610,38 @@ class ChessOrganizer:
         pts, sb = self._calc_points_sb(t)
 
         if not args:
+            # Build standings with rank, Name (ID), PTS, SB, W-D-L
             players = [(pid, t["players"][pid]["name"], pts.get(pid, 0), sb.get(pid, 0))
                        for pid in t["players"] if pid != "0"]
+            # Sort by pts desc, sb desc, id asc for stable ranking
             players.sort(key=lambda x: (-x[2], -x[3], int(x[0])))
+
+            # Calculate ranks with tie handling
+            standings = []
+            current_rank = 1
+            for i, (pid, name, p, s) in enumerate(players):
+                if i > 0:
+                    prev_p, prev_s = players[i - 1][2], players[i - 1][3]
+                    if p != prev_p or s != prev_s:
+                        current_rank = i + 1
+                # Calculate W-D-L
+                w = d = l = 0
+                for r in t["rounds"]:
+                    for g in r["games"]:
+                        if g["white"] == pid or g["black"] == pid:
+                            if g["result"] == "d":
+                                d += 1
+                            elif g["result"]:
+                                if (g["white"] == pid and g["result"] == "w") or (
+                                        g["black"] == pid and g["result"] == "b"):
+                                    w += 1
+                                else:
+                                    l += 1
+                standings.append((current_rank, f"{name} ({pid})", f"{p:.1f}", f"{s:.2f}", f"{w}-{d}-{l}"))
+
             print(f"\n{CYAN}=== LIVE STANDINGS ==={RESET}")
-            self._render_table(["ID", "NAME", "PTS", "SB"], players, ["right", "left", "right", "right"])
+            self._render_table(["RANK", "NAME (ID)", "PTS", "SB", "W-D-L"], standings,
+                               ["right", "left", "right", "right", "center"])
         else:
             pid = args[0]
             if pid == "0" or pid not in t["players"]:
@@ -503,23 +682,30 @@ class ChessOrganizer:
             ("tournaments", "", "List all tournaments & round counts"),
             ("", "[name]", "Create new or load existing tournament"),
             ("", "[name] del", "Delete tournament & associated data"),
-            ("add", "<player_name>", "Register a player (auto-assigned numeric ID)"),
+            ("player", "add <name>", "Register a player (auto-assigned numeric ID)"),
+            ("", "del <id>", "Delete player (replaces matches with BYE)"),
+            ("", "switch <id> <name>", "Rename a player by ID"),
             ("rounds", "", "Show round overview & completion status"),
-            ("", "gen [rr|drr]", "Generate and append round-robin schedule"),
+            ("", "gen [rr|drr|pts]", "Generate round-robin or points-based round"),
             ("", "<number>", "Show detailed pairings & unmatched players"),
             ("", "<r> <w_id> <b_id> add", "Add custom game to specific round"),
-            ("", "<r> <g_a> <g_b> switch", "Swap board positions of two games"),
+            ("", "<r> <ga> <gb> switch", "Swap board positions of two games"),
             ("", "<r> <game> del", "Remove specific game (auto-renumbers)"),
-            ("", "clear", "Wipe all rounds & results"),
+            ("", "clear [round_num]", "Wipe all rounds or specific round"),
             ("", "<r> <game> res [w|d|b]", "Record game outcome for round/game"),
             ("info", "", "Display live standings table"),
             ("", "<player_id>", "Show match history & SB contribution"),
             ("help", "", "Display this command manual"),
+            ("version", "", "Show application version"),
             ("exit", "", "Save tournament state & close application"),
         ]
         rows = [(f"{GREEN}{cmd}{RESET}", usage, desc) for cmd, usage, desc in entries]
         print()
         self._render_table(["COMMAND", "USAGE", "DESCRIPTION"], rows, alignments=["left", "left", "left"])
+
+    def _cmd_version(self):
+        """Displays application version information."""
+        print(f"\n{CYAN}Chess Tournament Organizer v{VERSION}{RESET}")
 
     # --- Interactive Command Loop ---
     def _cli_loop(self):
@@ -536,12 +722,14 @@ class ChessOrganizer:
                     self._show_help()
                 elif cmd == "tournaments":
                     self._cmd_tournaments(arg.split() if arg else [])
-                elif cmd == "add":
-                    self._cmd_add(arg.strip())
+                elif cmd == "player":
+                    self._cmd_player(arg.split() if arg else [])
                 elif cmd == "rounds":
                     self._cmd_rounds(arg.split() if arg else [])
                 elif cmd == "info":
                     self._cmd_info(arg.split())
+                elif cmd == "version":
+                    self._cmd_version()
                 elif cmd == "exit":
                     print(f"\n{GREEN}Saving & exiting...{RESET}")
                     self._save_state()
